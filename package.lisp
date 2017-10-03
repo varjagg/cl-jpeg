@@ -1,6 +1,6 @@
-(defpackage #:jpeg
+(defpackage #:cl-jpeg
   (:use #:common-lisp)
-  (:nicknames #:cl-jpeg)
+  (:nicknames #:jpeg)
   (:export #:encode-image
            #:decode-stream
            #:decode-image
