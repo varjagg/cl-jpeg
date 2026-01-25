@@ -70,7 +70,10 @@
 (declaim (inline csize quantize get-average zigzag read-jpeg-byte
                  llm-dct descale crunch colorspace-convert subsample inverse-llm-dct
                  dequantize upsample extend recieve decode-ac decode-dc decode-block
-                 izigzag write-bits limit))
+                 izigzag write-bits limit
+                 progressive-refine-coef progressive-decode-dc-first
+                 progressive-decode-dc-refine progressive-decode-ac-first
+                 progressive-decode-ac-refine))
 
 (deftype uint8 () '(unsigned-byte 8))
 (deftype uint8-array () '(simple-array uint8 (*)))
