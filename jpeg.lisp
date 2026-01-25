@@ -1217,6 +1217,10 @@
   (ncomp 1 :type fixnum) ; number of image components in the scan
   (x 0 :type fixnum) ; current processing
   (y 0 :type fixnum) ; positions
+  (ss 0 :type fixnum) ; spectral selection start
+  (se 0 :type fixnum) ; spectral selection end
+  (ah 0 :type fixnum) ; successive approximation high
+  (al 0 :type fixnum) ; successive approximation low
   (cdesc (make-array 4
                      :initial-contents (loop repeat 4 collect (list 0 0)))
          :type (simple-array t (*)))) ; descriptors of all components in the scan
@@ -1254,6 +1258,11 @@
   (V (make-array 4) :type (simple-array t (*)))
   (iH (make-array 4) :type (simple-array t (*)))
   (iV (make-array 4) :type (simple-array t (*)))
+  (hmax 0 :type fixnum)
+  (vmax 0 :type fixnum)
+  (block-widths (make-array 4 :initial-element 0) :type (simple-array t (*)))
+  (block-heights (make-array 4 :initial-element 0) :type (simple-array t (*)))
+  (coeffs (make-array 4 :initial-element nil) :type (simple-array t (*)))
   (qdest (make-array 4) :type (simple-array t (*)))
   (zz (make-array 64 :element-type 'sint16) :type sint16-array)
   (ncomp 0 :type fixnum)
@@ -1799,14 +1808,330 @@
           for j fixnum from 0 below ncomp do
           (setf (first (aref (scan-cdesc scan) j)) (read-jpeg-byte image)) ; component ID
           (setf (second (aref (scan-cdesc scan) j)) (read-jpeg-byte image))) ; Td and Ta nibbles
-    (read-jpeg-byte image)
-    (read-jpeg-byte image)
-    (read-jpeg-byte image)
+    (setf (scan-ss scan) (read-jpeg-byte image))
+    (setf (scan-se scan) (read-jpeg-byte image))
+    (let ((ahal (read-jpeg-byte image)))
+      (setf (scan-ah scan) (ash ahal -4))
+      (setf (scan-al scan) (logand ahal 15)))
     (if (= (descriptor-restart-interval image) 0)
         (decode-chunk image scan zzbuf) ; reading the whole scan at once
       (loop for term = (decode-chunk image scan zzbuf)
             while (eq 'restart term)
             finally (return term))))) ; or in pieces
+
+;;; Progressive decoding helpers
+(defun progressive-refine-coef (coeffs idx nextbit s al)
+  (declare #.*optimize*
+	   (type sint16-array coeffs)
+	   (type fixnum idx al)
+	   (type function nextbit))
+  (when (= 1 (funcall nextbit s))
+    (let ((delta (ash 1 al)))
+      (if (minusp (aref coeffs idx))
+	  (decf (aref coeffs idx) delta)
+	(incf (aref coeffs idx) delta)))))
+
+(defun progressive-decode-dc-first (coeffs idx dc-table nextbit s pred al)
+  (declare #.*optimize*
+	   (type sint16-array coeffs)
+	   (type fixnum idx pred al)
+	   (type function nextbit)
+	   (type huffstruct dc-table))
+  (let ((diff (decode-dc (huffstruct-maxcode dc-table)
+			 (huffstruct-mincode dc-table)
+			 (huffstruct-valptr dc-table)
+			 (huffstruct-huffval dc-table)
+			 nextbit s)))
+    (setf pred (plus pred diff))
+    (setf (aref coeffs idx) (ash pred al))
+    pred))
+
+(defun progressive-decode-dc-refine (coeffs idx nextbit s al)
+  (declare #.*optimize*
+	   (type sint16-array coeffs)
+	   (type fixnum idx al)
+	   (type function nextbit))
+  (progressive-refine-coef coeffs idx nextbit s al))
+
+(defun progressive-decode-ac-first (coeffs base-index ac-table nextbit s ss se al eobrun)
+  (declare #.*optimize*
+	   (type sint16-array coeffs)
+	   (type fixnum base-index ss se al eobrun)
+	   (type function nextbit)
+	   (type huffstruct ac-table))
+  (block done
+    (when (> eobrun 0)
+      (return-from done (1- eobrun)))
+    (let ((k ss))
+      (loop while (<= k se) do
+	    (let* ((rs (decode (huffstruct-maxcode ac-table)
+			       (huffstruct-mincode ac-table)
+			       (huffstruct-valptr ac-table)
+			       (huffstruct-huffval ac-table)
+			       nextbit s))
+		   (ssss (logand rs 15))
+		   (r (ash rs -4)))
+	      (cond ((= ssss 0)
+		     (if (= r 15)
+			 (incf k 16)
+		       (progn
+			 (setf eobrun (ash 1 r))
+			 (when (> r 0)
+			   (incf eobrun (recieve r nextbit s)))
+			 (return-from done (1- eobrun)))))
+		    (t
+		     (incf k r)
+		     (when (> k se)
+		       (return-from done eobrun))
+		     (setf (aref coeffs (plus base-index k))
+			   (ash (extend (recieve ssss nextbit s) ssss) al))
+		     (incf k))))))
+    eobrun))
+
+(defun progressive-decode-ac-refine (coeffs base-index ac-table nextbit s ss se al eobrun)
+  (declare #.*optimize*
+	   (type sint16-array coeffs)
+	   (type fixnum base-index ss se al eobrun)
+	   (type function nextbit)
+	   (type huffstruct ac-table))
+  (block done
+    (labels ((refine-index (k)
+	       (let ((idx (plus base-index k)))
+		 (when (/= (aref coeffs idx) 0)
+		   (progressive-refine-coef coeffs idx nextbit s al))))
+	     (skip-zeros (k r)
+	       (loop while (and (<= k se)
+				(or (> r 0)
+				    (/= (aref coeffs (plus base-index k)) 0))) do
+		     (let ((idx (plus base-index k)))
+		       (if (/= (aref coeffs idx) 0)
+			   (progressive-refine-coef coeffs idx nextbit s al)
+			 (decf r))
+		       (incf k)))
+	       (values k r)))
+      (when (> eobrun 0)
+	(loop for k fixnum from ss to se do
+	      (refine-index k))
+	(return-from done (1- eobrun)))
+      (let ((k ss))
+	(loop while (<= k se) do
+	      (let ((idx (plus base-index k)))
+		(if (/= (aref coeffs idx) 0)
+		    (progn
+		      (progressive-refine-coef coeffs idx nextbit s al)
+		      (incf k))
+		  (let* ((rs (decode (huffstruct-maxcode ac-table)
+				     (huffstruct-mincode ac-table)
+				     (huffstruct-valptr ac-table)
+				     (huffstruct-huffval ac-table)
+				     nextbit s))
+			 (sbit (logand rs 1))
+			 (r (ash rs -4)))
+		    (cond ((= sbit 0)
+			   (if (= r 15)
+			       (setf r 16)
+			     (progn
+			       (setf eobrun (ash 1 r))
+			       (when (> r 0)
+				 (incf eobrun (recieve r nextbit s)))
+			       (loop for kk fixnum from k to se do
+				     (refine-index kk))
+			       (return-from done (1- eobrun))))
+			   (multiple-value-bind (k2 ignored) (skip-zeros k r)
+			     (declare (ignore ignored))
+			     (setf k k2)))
+			  (t
+			   (multiple-value-bind (k2 ignored) (skip-zeros k r)
+			     (declare (ignore ignored))
+			     (setf k k2))
+			   (when (> k se)
+			     (return-from done eobrun))
+			   (let* ((bit (funcall nextbit s))
+				  (val (ash 1 al)))
+			     (setf (aref coeffs (plus base-index k))
+				   (if (= bit 1) val (- val))))
+			   (incf k)))))))))
+      eobrun))
+
+(defun drain-to-marker (nextbit s)
+  "Read bits until the next marker is encountered, returning that marker."
+  (catch 'marker
+    (loop do (funcall nextbit s))))
+
+(defun decode-progressive-chunk (image scan)
+  "Reads and decodes either a whole progressive scan or restart interval."
+  (let* ((nextbit (make-nextbit 0 0))
+	 (ncomp (scan-ncomp scan))
+	 (ss (scan-ss scan))
+	 (se (scan-se scan))
+	 (ah (scan-ah scan))
+	 (al (scan-al scan))
+	 (dc-scan-p (and (= ss 0) (= se 0)))
+	 (scan-hmax 0)
+	 (scan-vmax 0)
+	 (x-growth 0)
+	 (y-growth 0)
+	 (preds (make-array ncomp :element-type 'sint16 :initial-element 0))
+	 (eobrun 0)
+	 (comp-h (make-array ncomp :element-type 'fixnum))
+	 (comp-v (make-array ncomp :element-type 'fixnum))
+	 (comp-bw (make-array ncomp :element-type 'fixnum))
+	 (comp-bh (make-array ncomp :element-type 'fixnum))
+	 (comp-coefs (make-array ncomp))
+	 (comp-dc (make-array ncomp))
+	 (comp-ac (make-array ncomp)))
+    (declare #.*optimize*
+	     (type fixnum ncomp ss se ah al scan-hmax scan-vmax x-growth y-growth eobrun)
+	     (type (simple-array sint16 (*)) preds))
+    (loop for i fixnum from 0 below ncomp do
+	  (let* ((cid (first (aref (scan-cdesc scan) i)))
+		 (pos (position cid (descriptor-cid image)))
+		 (sel (second (aref (scan-cdesc scan) i)))
+		 (ta (logand sel 15))
+		 (td (ash sel -4)))
+	    (unless pos (error 'jpeg-decoder-error))
+	    (setf (aref comp-h i) (aref (descriptor-H image) pos))
+	    (setf (aref comp-v i) (aref (descriptor-V image) pos))
+	    (setf (aref comp-bw i) (aref (descriptor-block-widths image) pos))
+	    (setf (aref comp-bh i) (aref (descriptor-block-heights image) pos))
+	    (setf (aref comp-coefs i) (aref (descriptor-coeffs image) pos))
+	    (setf (aref comp-ac i) (aref (descriptor-huff-ac image) ta))
+	    (setf (aref comp-dc i) (aref (descriptor-huff-dc image) td))))
+    (loop for i fixnum from 0 below ncomp do
+	  (setf scan-hmax (max scan-hmax (aref comp-h i)))
+	  (setf scan-vmax (max scan-vmax (aref comp-v i))))
+    (setf x-growth (ash scan-hmax 3)
+	  y-growth (ash scan-vmax 3))
+    (catch 'marker
+      (loop
+	do (let* ((mcu-col (truncate (scan-x scan) x-growth))
+		  (mcu-row (truncate (scan-y scan) y-growth)))
+	     (loop for ci fixnum from 0 below ncomp do
+		   (let* ((Hc (aref comp-h ci))
+			  (Vc (aref comp-v ci))
+			  (bw (aref comp-bw ci))
+			  (bh (aref comp-bh ci))
+			  (coefs (aref comp-coefs ci))
+			  (dc-table (aref comp-dc ci))
+			  (ac-table (aref comp-ac ci))
+			  (block-x-base (the fixnum (* mcu-col Hc)))
+			  (block-y-base (the fixnum (* mcu-row Vc))))
+		     (loop for by fixnum from 0 below Vc do
+			   (loop for bx fixnum from 0 below Hc do
+				 (let ((block-x (the fixnum (+ block-x-base bx)))
+				       (block-y (the fixnum (+ block-y-base by))))
+				   (when (and (< block-x bw) (< block-y bh))
+				     (let ((base-index (the fixnum (* (plus (mul block-y bw) block-x) 64))))
+				       (if dc-scan-p
+					   (if (= ah 0)
+					       (setf (aref preds ci)
+						     (progressive-decode-dc-first
+						      coefs base-index dc-table nextbit image
+						      (aref preds ci) al))
+					     (progressive-decode-dc-refine
+					      coefs base-index nextbit image al))
+					 (if (= ah 0)
+					     (setf eobrun
+						   (progressive-decode-ac-first
+						    coefs base-index ac-table nextbit image
+						    ss se al eobrun))
+					   (setf eobrun
+						 (progressive-decode-ac-refine
+						  coefs base-index ac-table nextbit image
+						  ss se al eobrun))))))))))))
+	   (incf (scan-x scan) x-growth)
+	   (when (<= (descriptor-width image) (scan-x scan))
+	     (setf (scan-x scan) 0)
+	     (incf (scan-y scan) y-growth))
+	   (when (<= (descriptor-height image) (scan-y scan))
+	     (return-from decode-progressive-chunk
+	       (drain-to-marker nextbit image)))))))
+
+(defun decode-progressive-scan (image)
+  "Progressive scan decoding subroutine."
+  (let ((scan (make-scan)))
+    (read-jpeg-byte image) ; length
+    (read-jpeg-byte image)
+    (loop with ncomp fixnum = (setf (scan-ncomp scan) (read-jpeg-byte image))
+	  for j fixnum from 0 below ncomp do
+	  (setf (first (aref (scan-cdesc scan) j)) (read-jpeg-byte image)) ; component ID
+	  (setf (second (aref (scan-cdesc scan) j)) (read-jpeg-byte image))) ; Td and Ta nibbles
+    (setf (scan-ss scan) (read-jpeg-byte image))
+    (setf (scan-se scan) (read-jpeg-byte image))
+    (let ((ahal (read-jpeg-byte image)))
+      (setf (scan-ah scan) (ash ahal -4))
+      (setf (scan-al scan) (logand ahal 15)))
+    (setf (scan-x scan) 0
+	  (scan-y scan) 0)
+    (if (= (descriptor-restart-interval image) 0)
+	(decode-progressive-chunk image scan)
+      (loop for term = (decode-progressive-chunk image scan)
+	    while (eq 'restart term)
+	    finally (return term)))))
+
+(defun render-progressive-image (image)
+  "Renders decoded progressive coefficients into the output buffer."
+  (let* ((ncomp (descriptor-ncomp image))
+	 (nwidth (mul (descriptor-width image) ncomp))
+	 (dend (mul (descriptor-height image) nwidth))
+	 (scan (make-scan))
+	 (zz (descriptor-zz image))
+	 (zzbuf (2d-sint16-array
+		 '(0  0  0  0  0  0  0  0)
+		 '(0  0  0  0  0  0  0  0)
+		 '(0  0  0  0  0  0  0  0)
+		 '(0  0  0  0  0  0  0  0)
+		 '(0  0  0  0  0  0  0  0)
+		 '(0  0  0  0  0  0  0  0)
+		 '(0  0  0  0  0  0  0  0)
+		 '(0  0  0  0  0  0  0  0))))
+    (declare #.*optimize*
+	     (type fixnum ncomp nwidth dend)
+	     (type sint16-array zz))
+    (setf (scan-x scan) 0
+	  (scan-y scan) 0)
+    (loop for comp fixnum from 0 below ncomp do
+	  (let* ((H (aref (descriptor-iH image) comp))
+		 (V (aref (descriptor-iV image) comp))
+		 (bw (aref (descriptor-block-widths image) comp))
+		 (bh (aref (descriptor-block-heights image) comp))
+		 (coefs (aref (descriptor-coeffs image) comp))
+		 (q-tab (aref (descriptor-qtables image) (aref (descriptor-qdest image) comp)))
+		 (pos comp)
+		 (nx (mul ncomp H))
+		 (nw (mul nwidth V)))
+	    (when (typep coefs 'sint16-array)
+	      (loop for by fixnum from 0 below bh
+		    for y-pos fixnum from 0 by (ash V 3) do
+		    (loop for bx fixnum from 0 below bw
+			  for x-pos fixnum from 0 by (ash H 3) do
+			  (let ((base (mul (plus (mul by bw) bx) 64)))
+			    (loop for k fixnum from 0 below 64 do
+				  (setf (aref zz k) (aref coefs (plus base k)))))
+			  (let ((block (izigzag zz zzbuf)))
+			    (inverse-llm-dct block q-tab (descriptor-ws image))
+			    (upsample image scan block x-pos y-pos
+				      H V pos nwidth nw nx dend)))))))))
+
+(defun decode-frame-progressive (image buffer)
+  "Progressive frame decoding subroutine."
+  (decode-frame-beginning image buffer)
+  (loop for i fixnum from 0 below (descriptor-ncomp image)
+	with hv fixnum do
+	  (setf (aref (descriptor-cid image) i) (read-jpeg-byte image)) ; Cj
+	  (setf hv (read-jpeg-byte image))			      ; HV
+	  (setf (aref (descriptor-H image) i) (ash hv -4))
+	  (setf (aref (descriptor-V image) i) (logand hv 7))
+	  (setf (aref (descriptor-qdest image) i) (read-jpeg-byte image)))
+  (finalize-frame-info image)
+  (ensure-progressive-coeffs image)
+  (loop with term fixnum = 0
+	for j fixnum from 0
+	until (= term +M_EOI+) do
+	  (when (/= (interpret-markers image term) +M_SOS+)
+	    (error 'unsupported-jpeg-frame-marker))
+	  (setf term (decode-progressive-scan image)))
+  (render-progressive-image image))
 
 ;;; Function that bounds value in 0..255 range
 (defun limit (n)
@@ -1893,6 +2218,46 @@
 	      :element-type 'uint8
 	      :initial-element 0))
 
+(defun finalize-frame-info (image)
+  "Computes sampling conversion factors and block dimensions for the current frame."
+  (let* ((ncomp (descriptor-ncomp image))
+	 (frl (loop for i fixnum from 0 below ncomp
+		    collecting (list (aref (descriptor-H image) i)
+				     (aref (descriptor-V image) i))))
+	 (Hmax (loop for entry in frl maximize (first entry)))
+	 (Vmax (loop for entry in frl maximize (second entry)))
+	 (freqs (convert-sampling frl Hmax Vmax)))
+    (declare #.*optimize*
+	     (type fixnum ncomp Hmax Vmax))
+    (setf (descriptor-hmax image) Hmax
+	  (descriptor-vmax image) Vmax)
+    (loop for entry across freqs
+	  for i fixnum from 0 do
+	    (setf (aref (descriptor-iH image) i) (first entry))
+	    (setf (aref (descriptor-iV image) i) (second entry)))
+    (multiple-value-bind (mcu-cols nil1) (ceiling (descriptor-width image) (ash Hmax 3))
+      (declare (ignore nil1) (type fixnum mcu-cols))
+      (multiple-value-bind (mcu-rows nil2) (ceiling (descriptor-height image) (ash Vmax 3))
+	(declare (ignore nil2) (type fixnum mcu-rows))
+	(loop for i fixnum from 0 below ncomp do
+	      (setf (aref (descriptor-block-widths image) i)
+		    (the fixnum (* mcu-cols (aref (descriptor-H image) i))))
+	      (setf (aref (descriptor-block-heights image) i)
+		    (the fixnum (* mcu-rows (aref (descriptor-V image) i)))))))))
+
+(defun ensure-progressive-coeffs (image)
+  "Allocates or clears coefficient buffers for progressive decoding."
+  (loop for i fixnum from 0 below (descriptor-ncomp image) do
+       (let* ((bw (aref (descriptor-block-widths image) i))
+	      (bh (aref (descriptor-block-heights image) i))
+	      (size (the fixnum (* bw bh 64)))
+	      (buf (aref (descriptor-coeffs image) i)))
+	 (if (and (typep buf 'sint16-array)
+		  (= (length buf) size))
+	     (fill buf 0)
+	   (setf (aref (descriptor-coeffs image) i)
+		 (make-array size :element-type 'sint16 :initial-element 0))))))
+
 (defun decode-frame-beginning (image buffer)
   (read-jpeg-byte image) ; length
   (read-jpeg-byte image)
@@ -1921,26 +2286,16 @@
        (setf (aref (descriptor-H image) i) (ash hv -4))
        (setf (aref (descriptor-V image) i) (logand hv 7))
        (setf (aref (descriptor-qdest image) i) (read-jpeg-byte image)))
-	(let* ((frl (loop for i fixnum from 0 below (descriptor-ncomp image)
-		       collecting (list (aref (descriptor-H image) i)
-					(aref (descriptor-V image) i))))
-	       (Hmax (loop for entry in frl maximize (first entry)))
-	       (Vmax (loop for entry in frl maximize (second entry)))
-	       (freqs (convert-sampling frl Hmax Vmax)))
-	  (loop for entry across freqs
-	     for i fixnum from 0 do
-	       (setf (aref (descriptor-iH image) i) (first entry))
-	       (setf (aref (descriptor-iV image) i) (second entry)))
-	  (loop with term fixnum = 0
-	     for j fixnum from 0
-	     until (= term +M_EOI+) do
-	       (when (/= (interpret-markers image term) +M_SOS+)
-		 (error 'unsupported-jpeg-frame-marker))
-	       (setf term (decode-scan image j)))))
+  (finalize-frame-info image)
+  (loop with term fixnum = 0
+     for j fixnum from 0
+     until (= term +M_EOI+) do
+       (when (/= (interpret-markers image term) +M_SOS+)
+	 (error 'unsupported-jpeg-frame-marker))
+       (setf term (decode-scan image j))))
 
 (defun decode-stream (stream &key buffer (colorspace-conversion t) descriptor cached-source-p (decode-frame t))
-  "Return image array, height, width, number of components and APP14 Adobe transform. Does not support
-progressive DCT-based JPEGs."
+  "Return image array, height, width, number of components and APP14 Adobe transform."
   (when (and (null stream) (not cached-source-p))
     (error 'invalid-buffer-supplied))
   (when descriptor
@@ -1973,17 +2328,19 @@ progressive DCT-based JPEGs."
       (error 'unrecognized-file-format))
      (let ((marker (interpret-markers image 0)))
        (if decode-frame
-           ;; decode-frame currently only supports baseline DCT frames
-           (cond ((= +M_SOF0+ marker)
-                  (decode-frame image buffer)
-                  (when colorspace-conversion
-                    (cond ((and (= (descriptor-ncomp image) 3) (eql (descriptor-adobe-app14-transform image) :ycbcr-rgb))
-                           (inverse-colorspace-convert image))
-                          ((eql (descriptor-adobe-app14-transform image) :ycck-cmyk)
-                           (ycck-cmyk-convert image))
-                          ((= (descriptor-ncomp image) 3)
-                           (inverse-colorspace-convert image)))))
-                 (t (error 'unsupported-jpeg-format :code marker)))
+           (progn
+             (cond ((= +M_SOF0+ marker)
+                    (decode-frame image buffer))
+                   ((= +M_SOF2+ marker)
+                    (decode-frame-progressive image buffer))
+                   (t (error 'unsupported-jpeg-format :code marker)))
+             (when colorspace-conversion
+               (cond ((and (= (descriptor-ncomp image) 3) (eql (descriptor-adobe-app14-transform image) :ycbcr-rgb))
+                      (inverse-colorspace-convert image))
+                     ((eql (descriptor-adobe-app14-transform image) :ycck-cmyk)
+                      (ycck-cmyk-convert image))
+                     ((= (descriptor-ncomp image) 3)
+                      (inverse-colorspace-convert image)))))
            ;; decode-frame-beginning supports baselnie DCT frames
            ;; and progressive DCT frames, so allow those
            (cond ((or (= +M_SOF0+ marker)
