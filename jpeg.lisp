@@ -95,7 +95,7 @@
 (deftype fixnum-2d-array () '(simple-array fixnum-array (*)))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (defparameter *optimize* '(optimize (safety 0) (space 0) (debug 0) (speed 3))))
+(defparameter *optimize* '(optimize (safety 3) (space 0) (debug 3) (speed 3))))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 ;;; For ease of reference
@@ -1386,9 +1386,10 @@
     (loop for tcth fixnum = (read-jpeg-byte image)
           for tc fixnum = (ash tcth -4)
           for th fixnum = (logand tcth 15)
+          ;; tc=0 => DC table, tc=1 => AC table
           for tables = (if (zerop tc)
-                           (aref (descriptor-huff-ac image) th)
-                         (aref (descriptor-huff-dc image) th))
+                           (aref (descriptor-huff-dc image) th)
+                         (aref (descriptor-huff-ac image) th))
           for bits = (huffstruct-bits tables)
           for sum fixnum = 0 do
           (loop for i fixnum from 0 to 15
@@ -1904,67 +1905,74 @@
 	   (type function nextbit)
 	   (type huffstruct ac-table))
   (block done
-	    (labels ((refine-index (k)
-	       (let ((idx (plus base-index k)))
-		 (when (/= (aref coeffs idx) 0)
-		   (progressive-refine-coef coeffs idx nextbit s al))))
-	     (skip-zeros (k r)
-	       (declare (type fixnum k r))
-	       (loop while (and (<= k se)
-				(or (> r 0)
-				    (/= (aref coeffs (plus base-index k)) 0))) do
-		     (let ((idx (plus base-index k)))
-		       (if (/= (aref coeffs idx) 0)
-			   (progressive-refine-coef coeffs idx nextbit s al)
-			 (decf r))
-		       (incf k)))
-	       (values k r)))
-      (when (> eobrun 0)
-		(loop for k fixnum from ss to se do
-		      (refine-index k))
-		(return-from done (1- eobrun)))
-	      (let ((k (the fixnum ss)))
-		(declare (type fixnum k))
-		(loop while (<= k se) do
-		      (let ((idx (plus base-index k)))
-			(if (/= (aref coeffs idx) 0)
-			    (progn
-			      (progressive-refine-coef coeffs idx nextbit s al)
-			      (incf k))
-		  (let* ((rs (the fixnum
-				  (decode (huffstruct-maxcode ac-table)
-					  (huffstruct-mincode ac-table)
-					  (huffstruct-valptr ac-table)
-					  (huffstruct-huffval ac-table)
-					  nextbit s)))
-			 (sbit (the fixnum (logand (the fixnum rs) 1)))
-			 (r (the fixnum (ash (the fixnum rs) -4))))
-			    (declare (type fixnum rs sbit r))
-			    (cond ((= sbit 0)
-				   (if (= r 15)
-				       (setf r 16)
-				     (progn
-				       (setf eobrun (the fixnum (ash 1 r)))
-				       (when (> r 0)
-					 (incf eobrun (the fixnum (recieve r nextbit s))))
-				       (loop for kk fixnum from k to se do
-					     (refine-index kk))
-				       (return-from done (1- eobrun))))
-				   (multiple-value-bind (k2 ignored) (skip-zeros k r)
-				     (declare (ignore ignored))
-			     (setf k k2)))
-			  (t
-			   (multiple-value-bind (k2 ignored) (skip-zeros k r)
-			     (declare (ignore ignored))
-			     (setf k k2))
-				   (when (> k se)
-				     (return-from done eobrun))
-				   (let* ((bit (the fixnum (funcall nextbit s)))
-					  (val (the fixnum (ash 1 al))))
-				     (setf (aref coeffs (plus base-index k))
-					   (if (plusp bit) val (- val))))
-				   (incf k)))))))))
-      eobrun))
+    (let ((refine-threshold (the fixnum (ash 1 (the fixnum (1+ al))))))
+      (labels ((refine-index (k)
+		 (let* ((idx (plus base-index k))
+			(coef (aref coeffs idx)))
+		   (when (and (/= coef 0)
+			      (>= (the fixnum (abs (the fixnum coef)))
+				  refine-threshold))
+		     (progressive-refine-coef coeffs idx nextbit s al))))
+	       (skip-zeros (k r)
+		 (declare (type fixnum k r))
+		 (loop while (and (<= k se)
+				  (or (> r 0)
+				      (/= (aref coeffs (plus base-index k)) 0))) do
+		       (let ((idx (plus base-index k)))
+			 (if (/= (aref coeffs idx) 0)
+			     (refine-index k)
+			   (decf r))
+			 (incf k)))
+		 (values k r)))
+	(when (> eobrun 0)
+	  (loop for k fixnum from ss to se do
+		(refine-index k))
+	  (return-from done (1- eobrun)))
+	(let ((k (the fixnum ss)))
+	  (declare (type fixnum k))
+	  (loop while (<= k se) do
+		(let ((idx (plus base-index k)))
+		  (if (/= (aref coeffs idx) 0)
+		      (progn
+			(refine-index k)
+			(incf k))
+		    (let* ((rs (the fixnum
+				    (decode (huffstruct-maxcode ac-table)
+					    (huffstruct-mincode ac-table)
+					    (huffstruct-valptr ac-table)
+					    (huffstruct-huffval ac-table)
+					    nextbit s)))
+			   (sbit (the fixnum (logand (the fixnum rs) 1)))
+			   (r (the fixnum (ash (the fixnum rs) -4))))
+		      (declare (type fixnum rs sbit r))
+		      (cond ((= sbit 0)
+			     (if (= r 15)
+				 (progn
+				   ;; ZRL: process exactly 16 coefficient positions
+				   (loop for i fixnum from 0 below 16 do
+					 (when (> k se)
+					   (return-from done eobrun))
+					 (refine-index k)
+					 (incf k)))
+			       (progn
+				 (setf eobrun (the fixnum (ash 1 r)))
+				 (when (> r 0)
+				   (incf eobrun (the fixnum (recieve r nextbit s))))
+				 (loop for kk fixnum from k to se do
+				       (refine-index kk))
+				 (return-from done (1- eobrun)))))
+			    (t
+			     (multiple-value-bind (k2 ignored) (skip-zeros k r)
+			       (declare (ignore ignored))
+			       (setf k k2))
+			     (when (> k se)
+			       (return-from done eobrun))
+			     (let* ((bit (the fixnum (funcall nextbit s)))
+				    (val (the fixnum (ash 1 al))))
+			       (setf (aref coeffs (plus base-index k))
+				     (if (plusp bit) val (- val))))
+			     (incf k)))))))))
+	eobrun)))
 
 (defun drain-to-marker (nextbit s)
   "Read bits until the next marker is encountered, returning that marker."
@@ -1980,8 +1988,6 @@
 	 (ah (scan-ah scan))
 	 (al (scan-al scan))
 	 (dc-scan-p (and (= ss 0) (= se 0)))
-	 (scan-hmax 0)
-	 (scan-vmax 0)
 	 (x-growth 0)
 	 (y-growth 0)
 	 (preds (make-array ncomp :element-type 'sint16 :initial-element 0))
@@ -1994,7 +2000,7 @@
 	 (comp-dc (make-array ncomp))
 	 (comp-ac (make-array ncomp)))
     (declare #.*optimize*
-	     (type fixnum ncomp ss se ah al scan-hmax scan-vmax x-growth y-growth eobrun)
+	     (type fixnum ncomp ss se ah al x-growth y-growth eobrun)
 	     (type (simple-array sint16 (*)) preds))
     (loop for i fixnum from 0 below ncomp do
 	  (let* ((cid (first (aref (scan-cdesc scan) i)))
@@ -2010,11 +2016,8 @@
 	    (setf (aref comp-coefs i) (aref (descriptor-coeffs image) pos))
 	    (setf (aref comp-ac i) (aref (descriptor-huff-ac image) ta))
 	    (setf (aref comp-dc i) (aref (descriptor-huff-dc image) td))))
-    (loop for i fixnum from 0 below ncomp do
-	  (setf scan-hmax (the fixnum (max scan-hmax (aref comp-h i))))
-	  (setf scan-vmax (the fixnum (max scan-vmax (aref comp-v i)))))
-    (setf x-growth (the fixnum (ash scan-hmax 3))
-	  y-growth (the fixnum (ash scan-vmax 3)))
+    (setf x-growth (the fixnum (ash (descriptor-hmax image) 3))
+	  y-growth (the fixnum (ash (descriptor-vmax image) 3)))
     (catch 'marker
       (loop
 	do (let* ((mcu-col (the fixnum (truncate (scan-x scan) x-growth)))
